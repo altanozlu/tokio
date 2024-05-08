@@ -698,26 +698,26 @@ impl TcpSocket {
     ///     Ok(())
     /// }
     /// ```
-    pub fn listen(self, backlog: u32) -> io::Result<TcpListener> {
-        self.inner.listen(backlog as i32)?;
-        #[cfg(unix)]
-        let mio = {
-            use std::os::unix::io::{FromRawFd, IntoRawFd};
-
-            let raw_fd = self.inner.into_raw_fd();
-            unsafe { mio::net::TcpListener::from_raw_fd(raw_fd) }
-        };
-
-        #[cfg(windows)]
-        let mio = {
-            use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-
-            let raw_socket = self.inner.into_raw_socket();
-            unsafe { mio::net::TcpListener::from_raw_socket(raw_socket) }
-        };
-
-        TcpListener::new(mio)
-    }
+    // pub fn listen(self, backlog: u32) -> io::Result<TcpListener> {
+    //     self.inner.listen(backlog as i32)?;
+    //     #[cfg(unix)]
+    //     let mio = {
+    //         use std::os::unix::io::{FromRawFd, IntoRawFd};
+    // 
+    //         let raw_fd = self.inner.into_raw_fd();
+    //         unsafe { mio::net::TcpListener::from_raw_fd(raw_fd) }
+    //     };
+    // 
+    //     #[cfg(windows)]
+    //     let mio = {
+    //         use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+    // 
+    //         let raw_socket = self.inner.into_raw_socket();
+    //         unsafe { mio::net::TcpListener::from_raw_socket(raw_socket) }
+    //     };
+    // 
+    //     TcpListener::new(mio)
+    // }
 
     /// Converts a [`std::net::TcpStream`] into a `TcpSocket`. The provided
     /// socket must not have been connected prior to calling this function. This

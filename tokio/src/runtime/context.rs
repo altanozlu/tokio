@@ -1,7 +1,7 @@
 use crate::loom::thread::AccessError;
 use crate::runtime::coop;
 
-use std::cell::Cell;
+use std::cell::{Cell, Ref};
 
 #[cfg(any(feature = "rt", feature = "macros"))]
 use crate::util::rand::FastRand;
@@ -65,11 +65,11 @@ struct Context {
     budget: Cell<coop::Budget>,
 
     #[cfg(all(
-        tokio_unstable,
-        tokio_taskdump,
-        feature = "rt",
-        target_os = "linux",
-        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    tokio_unstable,
+    tokio_taskdump,
+    feature = "rt",
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
     ))]
     trace: trace::Context,
 }
@@ -118,6 +118,61 @@ tokio_thread_local! {
             ))]
             trace: trace::Context::new(),
         }
+    }
+}
+
+tokio_thread_local! {
+    pub(crate) static URING_CONTEXT: RuntimeContext = RuntimeContext::new();
+}
+use std::cell::RefCell;
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
+use mio::unix::SourceFd;
+use crate::io::Interest;
+use crate::io::unix::AsyncFd;
+use crate::runtime::io::Registration;
+use crate::runtime::io::uring::Handle;
+
+pub(crate) struct RuntimeContext {
+    pub driver: RefCell<Option<Handle>>,
+}
+
+impl RuntimeContext {
+    pub(crate) const fn new() -> Self {
+        Self {
+            driver: RefCell::new(None),
+        }
+    }
+    //crate::runtime::io::uring::Handle::new().unwrap()
+
+    pub(crate) fn handle(&self) -> crate::runtime::io::uring::Handle {
+        if self.driver.borrow().is_none() {
+            let new_handle = Handle::new().unwrap();
+            // {
+            //     let fd = {
+            //         new_handle.uring().as_raw_fd().clone()
+            //     };
+            //     unsafe {
+            //         let mut ring = new_handle.uring();
+            //         {
+            //             let mut s = ring.uring.submission();
+            //             let flags = io_uring::squeue::Flags::SKIP_SUCCESS;
+            //             let fl = flags.bits() as u32;
+            //             let fd = io_uring::types::Fd(fd);
+            //             println!("trying to send fd: {}", fd.0);
+            //             s.push(&io_uring::opcode::MsgRingData::new(fd, 0, 999987, None).build())
+            //                 .expect("queue is full");
+            //         }
+            //         ring.submit().unwrap();
+            //     }
+            // }
+            let mut guard = self.driver.borrow_mut();
+
+            assert!(guard.is_none(), "Attempted to initialize the driver twice");
+            *guard = Some(new_handle);
+        }
+        self.driver.borrow().clone().unwrap()
     }
 }
 

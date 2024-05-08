@@ -5,10 +5,14 @@ cfg_not_wasi! {
     use crate::net::{to_socket_addrs, ToSocketAddrs};
 }
 
-use std::fmt;
-use std::io;
-use std::net::{self, SocketAddr};
+use std::{fmt, ptr};
+use std::io::{self, Error};
+use std::net::{self, SocketAddr, SocketAddrV4};
+use std::os::fd::AsRawFd;
 use std::task::{Context, Poll};
+use crate::runtime::io::uring::Op;
+use crate::runtime::io::uring_op::SharedFd;
+use crate::runtime::RuntimeFlavor;
 
 cfg_net! {
     /// A TCP socket server, listening for connections.
@@ -52,7 +56,8 @@ cfg_net! {
     /// }
     /// ```
     pub struct TcpListener {
-        io: PollEvented<mio::net::TcpListener>,
+        io: Option<PollEvented<mio::net::TcpListener>>,
+        l: Option<net::TcpListener>,
     }
 }
 
@@ -118,8 +123,15 @@ impl TcpListener {
         }
 
         fn bind_addr(addr: SocketAddr) -> io::Result<TcpListener> {
-            let listener = mio::net::TcpListener::bind(addr)?;
-            TcpListener::new(listener)
+            if crate::runtime::Handle::current().runtime_flavor() == RuntimeFlavor::MultiThreadUring {
+                let listener = std::net::TcpListener::bind(("127.0.0.1", 3456))?;
+                Ok(TcpListener{ l: Some(listener), io: None})
+            } else {
+               let listener = mio::net::TcpListener::bind(addr)?;
+                 let io = PollEvented::new(listener)?;
+                  Ok(TcpListener{ l:None, io: Some(io)})
+            }
+
         }
     }
 
@@ -158,14 +170,23 @@ impl TcpListener {
     /// }
     /// ```
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        let (mio, addr) = self
-            .io
-            .registration()
-            .async_io(Interest::READABLE, || self.io.accept())
-            .await?;
+        if let Some(l) = &self.l {
+            let op = Op::accept(&SharedFd::new(l.as_raw_fd()))?;
+            let (sock, addr) = op.await?;
+            let stream = TcpStream::new_s(sock)?;
+            let sadr = addr.unwrap_or(SocketAddr::new(core::net::IpAddr::V4(core::net::Ipv4Addr::new(127, 0, 0, 1)), 8080));
+            Ok((stream, sadr))
+        } else if let Some(io) = &self.io {
+            let (mio, addr) = io
+                .registration()
+                .async_io(Interest::READABLE, || io.accept())
+                .await?;
 
-        let stream = TcpStream::new(mio)?;
-        Ok((stream, addr))
+            let stream = TcpStream::new(mio)?;
+            Ok((stream, addr))
+        } else {
+            unreachable!("l or io")
+        }
     }
 
     /// Polls to accept a new incoming connection to this listener.
@@ -175,20 +196,21 @@ impl TcpListener {
     /// to `poll_accept`, only the `Waker` from the `Context` passed to the most
     /// recent call is scheduled to receive a wakeup.
     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
-        loop {
-            let ev = ready!(self.io.registration().poll_read_ready(cx))?;
+        return Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+        // loop {
+        //     let ev = ready!(self.io.registration().poll_read_ready(cx))?;
 
-            match self.io.accept() {
-                Ok((io, addr)) => {
-                    let io = TcpStream::new(io)?;
-                    return Poll::Ready(Ok((io, addr)));
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.io.registration().clear_readiness(ev);
-                }
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-        }
+        //     match self.io.accept() {
+        //         Ok((io, addr)) => {
+        //             let io = TcpStream::new(io)?;
+        //             return Poll::Ready(Ok((io, addr)));
+        //         }
+        //         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+        //             self.io.registration().clear_readiness(ev);
+        //         }
+        //         Err(e) => return Poll::Ready(Err(e)),
+        //     }
+        // }
     }
 
     /// Creates new `TcpListener` from a `std::net::TcpListener`.
@@ -233,12 +255,12 @@ impl TcpListener {
     /// The runtime is usually set implicitly when this function is called
     /// from a future driven by a tokio runtime, otherwise runtime can be set
     /// explicitly with [`Runtime::enter`](crate::runtime::Runtime::enter) function.
-    #[track_caller]
-    pub fn from_std(listener: net::TcpListener) -> io::Result<TcpListener> {
-        let io = mio::net::TcpListener::from_std(listener);
-        let io = PollEvented::new(io)?;
-        Ok(TcpListener { io })
-    }
+    // #[track_caller]
+    // pub fn from_std(listener: net::TcpListener) -> io::Result<TcpListener> {
+    //     let io = mio::net::TcpListener::from_std(listener);
+    //     let io = PollEvented::new(io)?;
+    //     Ok(TcpListener { io })
+    // }
 
     /// Turns a [`tokio::net::TcpListener`] into a [`std::net::TcpListener`].
     ///
@@ -262,41 +284,41 @@ impl TcpListener {
     /// [`tokio::net::TcpListener`]: TcpListener
     /// [`std::net::TcpListener`]: std::net::TcpListener
     /// [`set_nonblocking`]: fn@std::net::TcpListener::set_nonblocking
-    pub fn into_std(self) -> io::Result<std::net::TcpListener> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::{FromRawFd, IntoRawFd};
-            self.io
-                .into_inner()
-                .map(IntoRawFd::into_raw_fd)
-                .map(|raw_fd| unsafe { std::net::TcpListener::from_raw_fd(raw_fd) })
-        }
+    // pub fn into_std(self) -> io::Result<std::net::TcpListener> {
+    //     #[cfg(unix)]
+    //     {
+    //         use std::os::unix::io::{FromRawFd, IntoRawFd};
+    //         self.io
+    //             .into_inner()
+    //             .map(IntoRawFd::into_raw_fd)
+    //             .map(|raw_fd| unsafe { std::net::TcpListener::from_raw_fd(raw_fd) })
+    //     }
 
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-            self.io
-                .into_inner()
-                .map(|io| io.into_raw_socket())
-                .map(|raw_socket| unsafe { std::net::TcpListener::from_raw_socket(raw_socket) })
-        }
+    //     #[cfg(windows)]
+    //     {
+    //         use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+    //         self.io
+    //             .into_inner()
+    //             .map(|io| io.into_raw_socket())
+    //             .map(|raw_socket| unsafe { std::net::TcpListener::from_raw_socket(raw_socket) })
+    //     }
 
-        #[cfg(target_os = "wasi")]
-        {
-            use std::os::wasi::io::{FromRawFd, IntoRawFd};
-            self.io
-                .into_inner()
-                .map(|io| io.into_raw_fd())
-                .map(|raw_fd| unsafe { std::net::TcpListener::from_raw_fd(raw_fd) })
-        }
-    }
+    //     #[cfg(target_os = "wasi")]
+    //     {
+    //         use std::os::wasi::io::{FromRawFd, IntoRawFd};
+    //         self.io
+    //             .into_inner()
+    //             .map(|io| io.into_raw_fd())
+    //             .map(|raw_fd| unsafe { std::net::TcpListener::from_raw_fd(raw_fd) })
+    //     }
+    // }
 
-    cfg_not_wasi! {
-        pub(crate) fn new(listener: mio::net::TcpListener) -> io::Result<TcpListener> {
-            let io = PollEvented::new(listener)?;
-            Ok(TcpListener { io })
-        }
-    }
+    // cfg_not_wasi! {
+    //     pub(crate) fn new(listener: mio::net::TcpListener) -> io::Result<TcpListener> {
+    //         let io = PollEvented::new(listener)?;
+    //         Ok(TcpListener { io })
+    //     }
+    // }
 
     /// Returns the local address that this listener is bound to.
     ///
@@ -322,7 +344,7 @@ impl TcpListener {
     /// }
     /// ```
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.io.local_addr()
+        self.l.as_ref().unwrap().local_addr()
     }
 
     /// Gets the value of the `IP_TTL` option for this socket.
@@ -349,7 +371,7 @@ impl TcpListener {
     /// }
     /// ```
     pub fn ttl(&self) -> io::Result<u32> {
-        self.io.ttl()
+        self.l.as_ref().unwrap().ttl()
     }
 
     /// Sets the value for the `IP_TTL` option on this socket.
@@ -374,25 +396,25 @@ impl TcpListener {
     /// }
     /// ```
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
-        self.io.set_ttl(ttl)
+        self.l.as_ref().unwrap().set_ttl(ttl)
     }
 }
 
-impl TryFrom<net::TcpListener> for TcpListener {
-    type Error = io::Error;
+// impl TryFrom<net::TcpListener> for TcpListener {
+//     type Error = io::Error;
 
-    /// Consumes stream, returning the tokio I/O object.
-    ///
-    /// This is equivalent to
-    /// [`TcpListener::from_std(stream)`](TcpListener::from_std).
-    fn try_from(stream: net::TcpListener) -> Result<Self, Self::Error> {
-        Self::from_std(stream)
-    }
-}
+//     /// Consumes stream, returning the tokio I/O object.
+//     ///
+//     /// This is equivalent to
+//     /// [`TcpListener::from_std(stream)`](TcpListener::from_std).
+//     fn try_from(stream: net::TcpListener) -> Result<Self, Self::Error> {
+//         Self::from_std(stream)
+//     }
+// }
 
 impl fmt::Debug for TcpListener {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.io.fmt(f)
+        self.l.fmt(f)
     }
 }
 
@@ -403,7 +425,11 @@ mod sys {
 
     impl AsRawFd for TcpListener {
         fn as_raw_fd(&self) -> RawFd {
-            self.io.as_raw_fd()
+            if let Some(l) = &self.l {
+                l.as_raw_fd()
+            } else {
+                self.io.as_ref().unwrap().as_raw_fd()
+            }
         }
     }
 

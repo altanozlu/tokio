@@ -499,6 +499,8 @@ cfg_fs! {
 mod future;
 
 pub mod io;
+pub type BufResult<T, B> = (std::io::Result<T>, B);
+mod buf;
 pub mod net;
 
 mod loom;

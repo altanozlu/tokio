@@ -76,7 +76,7 @@ impl Registration {
         handle: scheduler::Handle,
     ) -> io::Result<Registration> {
         let shared = handle.driver().io().add_source(io, interest)?;
-
+       // println!("io {:?} {:?} {:?}",shared.token(), interest, std::thread::current().id());
         Ok(Registration { handle, shared })
     }
 

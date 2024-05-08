@@ -8,11 +8,15 @@ use crate::io::{AsyncRead, AsyncWrite, Interest, PollEvented, ReadBuf, Ready};
 use crate::net::tcp::split::{split, ReadHalf, WriteHalf};
 use crate::net::tcp::split_owned::{split_owned, OwnedReadHalf, OwnedWriteHalf};
 
-use std::fmt;
+use std::{fmt, ptr};
+use std::fmt::Pointer;
 use std::io;
 use std::net::{Shutdown, SocketAddr};
+use std::ops::Deref;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use crate::buf::BoundedBufMut;
+use crate::runtime::io::uring::Op;
 
 cfg_io_util! {
     use bytes::BufMut;
@@ -67,9 +71,14 @@ cfg_net! {
     ///
     /// [`shutdown()`]: fn@crate::io::AsyncWriteExt::shutdown
     pub struct TcpStream {
-        io: PollEvented<mio::net::TcpStream>,
+        io_holder: IOHolder
     }
 }
+enum IOHolder {
+    MIO(PollEvented<mio::net::TcpStream>),
+    Uring(crate::runtime::io::uring_op::Socket),
+}
+
 
 impl TcpStream {
     cfg_not_wasi! {
@@ -146,19 +155,27 @@ impl TcpStream {
             // actually hit an error or not.
             //
             // If all that succeeded then we ship everything on up.
-            poll_fn(|cx| stream.io.registration().poll_write_ready(cx)).await?;
+            if let IOHolder::MIO(io) = &stream.io_holder {
+            poll_fn(|cx| io.registration().poll_write_ready(cx)).await?;
 
-            if let Some(e) = stream.io.take_error()? {
+            if let Some(e) = io.take_error()? {
                 return Err(e);
             }
 
             Ok(stream)
+            } else {
+                unreachable!("not mio")
+            }
         }
     }
 
     pub(crate) fn new(connected: mio::net::TcpStream) -> io::Result<TcpStream> {
         let io = PollEvented::new(connected)?;
-        Ok(TcpStream { io })
+        Ok(TcpStream { io_holder: IOHolder::MIO(io) })
+    }
+
+    pub(crate) fn new_s(s: crate::runtime::io::uring_op::Socket) -> io::Result<TcpStream> {
+        Ok(TcpStream { io_holder: IOHolder::Uring(s) })
     }
 
     /// Creates new `TcpStream` from a `std::net::TcpStream`.
@@ -202,7 +219,7 @@ impl TcpStream {
     pub fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
         let io = mio::net::TcpStream::from_std(stream);
         let io = PollEvented::new(io)?;
-        Ok(TcpStream { io })
+        Ok(TcpStream { io_holder: IOHolder::MIO(io) })
     }
 
     /// Turns a [`tokio::net::TcpStream`] into a [`std::net::TcpStream`].
@@ -247,10 +264,13 @@ impl TcpStream {
         #[cfg(unix)]
         {
             use std::os::unix::io::{FromRawFd, IntoRawFd};
-            self.io
-                .into_inner()
-                .map(IntoRawFd::into_raw_fd)
-                .map(|raw_fd| unsafe { std::net::TcpStream::from_raw_fd(raw_fd) })
+            if let IOHolder::MIO(io) = self.io_holder {
+                io.into_inner()
+                    .map(IntoRawFd::into_raw_fd)
+                    .map(|raw_fd| unsafe { std::net::TcpStream::from_raw_fd(raw_fd) })
+            } else {
+                unreachable!("not mio")
+            }
         }
 
         #[cfg(windows)]
@@ -287,12 +307,20 @@ impl TcpStream {
     /// # }
     /// ```
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.io.local_addr()
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.local_addr()
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Returns the value of the `SO_ERROR` option.
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
-        self.io.take_error()
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.take_error()
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Returns the remote address that this stream is connected to.
@@ -310,7 +338,11 @@ impl TcpStream {
     /// # }
     /// ```
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.io.peer_addr()
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.peer_addr()
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Attempts to receive data on the socket, without removing that data from
@@ -360,24 +392,28 @@ impl TcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<usize>> {
-        loop {
-            let ev = ready!(self.io.registration().poll_read_ready(cx))?;
+        if let IOHolder::MIO(io) = &self.io_holder {
+            loop {
+                let ev = ready!(io.registration().poll_read_ready(cx))?;
 
-            let b = unsafe {
-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
-            };
+                let b = unsafe {
+                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+                };
 
-            match self.io.peek(b) {
-                Ok(ret) => {
-                    unsafe { buf.assume_init(ret) };
-                    buf.advance(ret);
-                    return Poll::Ready(Ok(ret));
+                match io.peek(b) {
+                    Ok(ret) => {
+                        unsafe { buf.assume_init(ret) };
+                        buf.advance(ret);
+                        return Poll::Ready(Ok(ret));
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        io.registration().clear_readiness(ev);
+                    }
+                    Err(e) => return Poll::Ready(Err(e)),
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.io.registration().clear_readiness(ev);
-                }
-                Err(e) => return Poll::Ready(Err(e)),
             }
+        } else {
+            unreachable!("not mio")
         }
     }
 
@@ -444,7 +480,7 @@ impl TcpStream {
     ///                     println!("write {} bytes", n);
     ///                 }
     ///                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-    ///                     continue
+    ///                     continue;
     ///                 }
     ///                 Err(e) => {
     ///                     return Err(e.into());
@@ -455,10 +491,30 @@ impl TcpStream {
     /// }
     /// ```
     pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
-        let event = self.io.registration().readiness(interest).await?;
-        Ok(event.ready)
+        if let IOHolder::MIO(io) = &self.io_holder {
+            let event = io.registration().readiness(interest).await?;
+            Ok(event.ready)
+        } else {
+            unreachable!("not mio")
+        }
+    }
+    pub async fn read_uring<T: BoundedBufMut>(&self, buf: T) -> crate::BufResult<usize, T> {
+        if let IOHolder::Uring(uring) = &self.io_holder {
+            let op = Op::read_at(&uring.fd, buf, 0).unwrap();
+            op.await
+        } else {
+            unreachable!("not mio")
+        }
     }
 
+    pub async fn write_uring<T: BoundedBufMut>(&self, buf: T) -> crate::BufResult<usize, T> {
+        if let IOHolder::Uring(uring) = &self.io_holder {
+            let op = Op::write(&uring.fd, buf).unwrap();
+            op.await
+        } else {
+            unreachable!("not mio")
+        }
+    }
     /// Waits for the socket to become readable.
     ///
     /// This function is equivalent to `ready(Interest::READABLE)` and is usually
@@ -544,7 +600,11 @@ impl TcpStream {
     ///
     /// [`readable`]: method@Self::readable
     pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.io.registration().poll_read_ready(cx).map_ok(|_| ())
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.registration().poll_read_ready(cx).map_ok(|_| ())
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Tries to read data from the stream into the provided buffer, returning how
@@ -612,10 +672,12 @@ impl TcpStream {
     /// ```
     pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
         use std::io::Read;
-
-        self.io
-            .registration()
-            .try_io(Interest::READABLE, || (&*self.io).read(buf))
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.registration()
+                .try_io(Interest::READABLE, || io.deref().read(buf))
+        } else {
+            unreachable!("no try_read")
+        }
     }
 
     /// Tries to read data from the stream into the provided buffers, returning
@@ -691,9 +753,10 @@ impl TcpStream {
     pub fn try_read_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
         use std::io::Read;
 
-        self.io
-            .registration()
-            .try_io(Interest::READABLE, || (&*self.io).read_vectored(bufs))
+        // self.io.as_ref().unwrap()
+        //     .registration()
+        //     .try_io(Interest::READABLE, || (&*self.io.as_ref().unwrap()).read_vectored(bufs))
+        Ok(0)
     }
 
     cfg_io_util! {
@@ -755,23 +818,24 @@ impl TcpStream {
         /// }
         /// ```
         pub fn try_read_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize> {
-            self.io.registration().try_io(Interest::READABLE, || {
-                use std::io::Read;
-
-                let dst = buf.chunk_mut();
-                let dst =
-                    unsafe { &mut *(dst as *mut _ as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
-
-                // Safety: We trust `TcpStream::read` to have filled up `n` bytes in the
-                // buffer.
-                let n = (&*self.io).read(dst)?;
-
-                unsafe {
-                    buf.advance_mut(n);
-                }
-
-                Ok(n)
-            })
+            Ok(0)
+            // self.io.registration().try_io(Interest::READABLE, || {
+            //     use std::io::Read;
+            // 
+            //     let dst = buf.chunk_mut();
+            //     let dst =
+            //         unsafe { &mut *(dst as *mut _ as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+            // 
+            //     // Safety: We trust `TcpStream::read` to have filled up `n` bytes in the
+            //     // buffer.
+            //     let n = (&*self.io.as_ref().unwrap()).read(dst)?;
+            // 
+            //     unsafe {
+            //         buf.advance_mut(n);
+            //     }
+            // 
+            //     Ok(n)
+            // })
         }
     }
 
@@ -856,7 +920,11 @@ impl TcpStream {
     ///
     /// [`writable`]: method@Self::writable
     pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.io.registration().poll_write_ready(cx).map_ok(|_| ())
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.registration().poll_write_ready(cx).map_ok(|_| ())
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Try to write a buffer to the stream, returning how many bytes were
@@ -909,10 +977,13 @@ impl TcpStream {
     /// ```
     pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
         use std::io::Write;
-
-        self.io
-            .registration()
-            .try_io(Interest::WRITABLE, || (&*self.io).write(buf))
+        if let IOHolder::MIO(io) = &self.io_holder {
+            // io.registration()
+            //     .try_io(Interest::WRITABLE, || (&*io).write(buf))
+            Ok(0)
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Tries to write several buffers to the stream, returning how many bytes
@@ -971,10 +1042,11 @@ impl TcpStream {
     /// ```
     pub fn try_write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
         use std::io::Write;
-
-        self.io
-            .registration()
-            .try_io(Interest::WRITABLE, || (&*self.io).write_vectored(bufs))
+        // 
+        // self.io.as_ref().unwrap()
+        //     .registration()
+        //     .try_io(Interest::WRITABLE, || (&*self.io.as_ref().unwrap()).write_vectored(bufs))
+        Ok(0)
     }
 
     /// Tries to read or write from the socket using a user-provided IO operation.
@@ -1014,9 +1086,12 @@ impl TcpStream {
         interest: Interest,
         f: impl FnOnce() -> io::Result<R>,
     ) -> io::Result<R> {
-        self.io
-            .registration()
-            .try_io(interest, || self.io.try_io(f))
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.registration()
+                .try_io(interest, || io.try_io(f))
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Reads or writes from the socket using a user-provided IO operation.
@@ -1049,10 +1124,13 @@ impl TcpStream {
         interest: Interest,
         mut f: impl FnMut() -> io::Result<R>,
     ) -> io::Result<R> {
-        self.io
-            .registration()
-            .async_io(interest, || self.io.try_io(&mut f))
-            .await
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.registration()
+                .async_io(interest, || io.try_io(&mut f))
+                .await
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Receives data on the socket from the remote address to which it is
@@ -1093,10 +1171,13 @@ impl TcpStream {
     /// [`read`]: fn@crate::io::AsyncReadExt::read
     /// [`AsyncReadExt`]: trait@crate::io::AsyncReadExt
     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.io
-            .registration()
-            .async_io(Interest::READABLE, || self.io.peek(buf))
-            .await
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.registration()
+                .async_io(Interest::READABLE, || io.peek(buf))
+                .await
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -1105,7 +1186,11 @@ impl TcpStream {
     /// portions to return immediately with an appropriate value (see the
     /// documentation of `Shutdown`).
     pub(super) fn shutdown_std(&self, how: Shutdown) -> io::Result<()> {
-        self.io.shutdown(how)
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.shutdown(how)
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     /// Gets the value of the `TCP_NODELAY` option on this socket.
@@ -1126,9 +1211,9 @@ impl TcpStream {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn nodelay(&self) -> io::Result<bool> {
-        self.io.nodelay()
-    }
+    // pub fn nodelay(&self) -> io::Result<bool> {
+    //     self.io.as_ref().unwrap().nodelay()
+    // }
 
     /// Sets the value of the `TCP_NODELAY` option on this socket.
     ///
@@ -1151,7 +1236,11 @@ impl TcpStream {
     /// # }
     /// ```
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        self.io.set_nodelay(nodelay)
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.set_nodelay(nodelay)
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     cfg_not_wasi! {
@@ -1222,9 +1311,9 @@ impl TcpStream {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn ttl(&self) -> io::Result<u32> {
-        self.io.ttl()
-    }
+    // pub fn ttl(&self) -> io::Result<u32> {
+    //     self.io.as_ref().unwrap().ttl()
+    // }
 
     /// Sets the value for the `IP_TTL` option on this socket.
     ///
@@ -1243,9 +1332,9 @@ impl TcpStream {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
-        self.io.set_ttl(ttl)
-    }
+    // pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+    //     self.io.as_ref().unwrap().set_ttl(ttl)
+    // }
 
     // These lifetime markers also appear in the generated documentation, and make
     // it more clear that this is a *borrowed* split.
@@ -1288,7 +1377,13 @@ impl TcpStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         // Safety: `TcpStream::read` correctly handles reads into uninitialized memory
-        unsafe { self.io.poll_read(cx, buf) }
+        unsafe {
+            if let IOHolder::MIO(io) = &self.io_holder {
+                io.poll_read(cx, buf)
+            } else {
+                unreachable!("not mio")
+            }
+        }
     }
 
     pub(super) fn poll_write_priv(
@@ -1296,7 +1391,11 @@ impl TcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.io.poll_write(cx, buf)
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.poll_write(cx, buf)
+        } else {
+            unreachable!("not mio")
+        }
     }
 
     pub(super) fn poll_write_vectored_priv(
@@ -1304,7 +1403,11 @@ impl TcpStream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.io.poll_write_vectored(cx, bufs)
+        if let IOHolder::MIO(io) = &self.io_holder {
+            io.poll_write_vectored(cx, bufs)
+        } else {
+            unreachable!("not mio")
+        }
     }
 }
 
@@ -1367,18 +1470,24 @@ impl AsyncWrite for TcpStream {
 
 impl fmt::Debug for TcpStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.io.fmt(f)
+        match &self.io_holder {
+            IOHolder::MIO(io) => { io.fmt(f) }
+            IOHolder::Uring(io) => { io.fmt(f) }
+        }
     }
 }
 
 #[cfg(unix)]
 mod sys {
-    use super::TcpStream;
+    use super::{IOHolder, TcpStream};
     use std::os::unix::prelude::*;
 
     impl AsRawFd for TcpStream {
         fn as_raw_fd(&self) -> RawFd {
-            self.io.as_raw_fd()
+            match &self.io_holder {
+                IOHolder::MIO(io) => { io.as_raw_fd() }
+                IOHolder::Uring(io) => { io.fd.raw_fd() }
+            }
         }
     }
 

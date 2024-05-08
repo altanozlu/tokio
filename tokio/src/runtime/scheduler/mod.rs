@@ -23,6 +23,8 @@ cfg_rt_multi_thread! {
         pub(crate) mod multi_thread_alt;
         pub(crate) use multi_thread_alt::MultiThread as MultiThreadAlt;
     }
+    pub(crate) mod multi_thread_io_uring;
+    pub(crate) use multi_thread_io_uring::MultiThreadUring;
 }
 
 use crate::runtime::driver;
@@ -34,6 +36,9 @@ pub(crate) enum Handle {
 
     #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
     MultiThread(Arc<multi_thread::Handle>),
+
+    #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+    MultiThreadUring(Arc<multi_thread_io_uring::Handle>),
 
     #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
     MultiThreadAlt(Arc<multi_thread_alt::Handle>),
@@ -51,6 +56,8 @@ pub(super) enum Context {
 
     #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
     MultiThread(multi_thread::Context),
+    #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+    MultiThreadUring(multi_thread_io_uring::Context),
 
     #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
     MultiThreadAlt(multi_thread_alt::Context),
@@ -65,6 +72,9 @@ impl Handle {
 
             #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
             Handle::MultiThread(ref h) => &h.driver,
+
+            #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+            Handle::MultiThreadUring(ref h) => &h.driver,
 
             #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
             Handle::MultiThreadAlt(ref h) => &h.driver,
@@ -91,6 +101,8 @@ cfg_rt! {
 
                 #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
                 $ty::MultiThread($h) => $e,
+                #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+                $ty::MultiThreadUring($h) => $e,
 
                 #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
                 $ty::MultiThreadAlt($h) => $e,
@@ -121,6 +133,8 @@ cfg_rt! {
 
                 #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
                 Handle::MultiThread(h) => multi_thread::Handle::spawn(h, future, id),
+                #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+                Handle::MultiThreadUring(h) => multi_thread_io_uring::Handle::spawn(h, future, id),
 
                 #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
                 Handle::MultiThreadAlt(h) => multi_thread_alt::Handle::spawn(h, future, id),
@@ -133,6 +147,8 @@ cfg_rt! {
 
                 #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
                 Handle::MultiThread(ref h) => h.shutdown(),
+                #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+                Handle::MultiThreadUring(ref h) => h.shutdown(),
 
                 #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
                 Handle::MultiThreadAlt(ref h) => h.shutdown(),
@@ -230,6 +246,13 @@ cfg_rt! {
             pub(crate) fn expect_multi_thread(&self) -> &multi_thread::Context {
                 match self {
                     Context::MultiThread(context) => context,
+                    _ => panic!("expected `MultiThread::Context`")
+                }
+            }
+            #[track_caller]
+            pub(crate) fn expect_multi_thread_uring(&self) -> &multi_thread_io_uring::Context {
+                match self {
+                    Context::MultiThreadUring(context) => context,
                     _ => panic!("expected `MultiThread::Context`")
                 }
             }

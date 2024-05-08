@@ -8,7 +8,7 @@ use std::time::Duration;
 
 cfg_rt_multi_thread! {
     use crate::runtime::Builder;
-    use crate::runtime::scheduler::MultiThread;
+    use crate::runtime::scheduler::{MultiThreadUring, MultiThread};
 
     cfg_unstable! {
         use crate::runtime::scheduler::MultiThreadAlt;
@@ -115,6 +115,8 @@ pub enum RuntimeFlavor {
     /// The flavor that executes tasks across multiple threads.
     MultiThread,
     /// The flavor that executes tasks across multiple threads.
+    MultiThreadUring,
+    /// The flavor that executes tasks across multiple threads.
     #[cfg(tokio_unstable)]
     MultiThreadAlt,
 }
@@ -128,6 +130,9 @@ pub(super) enum Scheduler {
     /// Execute tasks across multiple threads.
     #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
     MultiThread(MultiThread),
+    /// Execute tasks across multiple threads.
+    #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+    MultiThreadUring(MultiThreadUring),
 
     /// Execute tasks across multiple threads.
     #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
@@ -238,9 +243,9 @@ impl Runtime {
     /// ```
     #[track_caller]
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        where
+            F: Future + Send + 'static,
+            F::Output: Send + 'static,
     {
         self.handle.spawn(future)
     }
@@ -264,9 +269,9 @@ impl Runtime {
     /// ```
     #[track_caller]
     pub fn spawn_blocking<F, R>(&self, func: F) -> JoinHandle<R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
+        where
+            F: FnOnce() -> R + Send + 'static,
+            R: Send + 'static,
     {
         self.handle.spawn_blocking(func)
     }
@@ -327,16 +332,16 @@ impl Runtime {
     #[track_caller]
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         #[cfg(all(
-            tokio_unstable,
-            tokio_taskdump,
-            feature = "rt",
-            target_os = "linux",
-            any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+        tokio_unstable,
+        tokio_taskdump,
+        feature = "rt",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
         ))]
-        let future = super::task::trace::Trace::root(future);
+            let future = super::task::trace::Trace::root(future);
 
         #[cfg(all(tokio_unstable, feature = "tracing"))]
-        let future = crate::util::trace::task(
+            let future = crate::util::trace::task(
             future,
             "block_on",
             None,
@@ -349,6 +354,8 @@ impl Runtime {
             Scheduler::CurrentThread(exec) => exec.block_on(&self.handle.inner, future),
             #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
             Scheduler::MultiThread(exec) => exec.block_on(&self.handle.inner, future),
+            #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+            Scheduler::MultiThreadUring(exec) => exec.block_on(&self.handle.inner, future),
             #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
             Scheduler::MultiThreadAlt(exec) => exec.block_on(&self.handle.inner, future),
         }
@@ -471,6 +478,12 @@ impl Drop for Runtime {
             }
             #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
             Scheduler::MultiThread(multi_thread) => {
+                // The threaded scheduler drops its tasks on its worker threads, which is
+                // already in the runtime's context.
+                multi_thread.shutdown(&self.handle.inner);
+            }
+            #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+            Scheduler::MultiThreadUring(multi_thread) => {
                 // The threaded scheduler drops its tasks on its worker threads, which is
                 // already in the runtime's context.
                 multi_thread.shutdown(&self.handle.inner);

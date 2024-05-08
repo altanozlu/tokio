@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering::{AcqRel, Release};
 use std::task::Poll::{Pending, Ready};
 use std::task::Waker;
 use std::time::Duration;
+use io_uring::squeue;
 
 /// Executes tasks on the current thread
 pub(crate) struct CurrentThread {
@@ -41,6 +42,7 @@ pub(crate) struct Handle {
 
     /// Current random number generator seed
     pub(crate) seed_generator: RngSeedGenerator,
+    pub(crate) uring_sqes: Vec<squeue::Entry>,
 }
 
 /// Data required for executing the scheduler. The struct is passed around to
@@ -141,6 +143,7 @@ impl CurrentThread {
             driver: driver_handle,
             blocking_spawner,
             seed_generator,
+            uring_sqes: vec![]
         });
 
         let core = AtomicCell::new(Some(Box::new(Core {
@@ -422,9 +425,9 @@ impl Handle {
         future: F,
         id: crate::runtime::task::Id,
     ) -> JoinHandle<F::Output>
-    where
-        F: crate::future::Future + Send + 'static,
-        F::Output: Send + 'static,
+        where
+            F: crate::future::Future + Send + 'static,
+            F::Output: Send + 'static,
     {
         let (handle, notified) = me.shared.owned.bind(future, me.clone(), id);
 
@@ -437,10 +440,10 @@ impl Handle {
 
     /// Capture a snapshot of this runtime's state.
     #[cfg(all(
-        tokio_unstable,
-        tokio_taskdump,
-        target_os = "linux",
-        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    tokio_unstable,
+    tokio_taskdump,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
     ))]
     pub(crate) fn dump(&self) -> crate::runtime::Dump {
         use crate::runtime::dump;
@@ -725,8 +728,8 @@ impl CoreGuard<'_> {
     /// Enters the scheduler context. This sets the queue and other necessary
     /// scheduler state in the thread-local.
     fn enter<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Box<Core>, &Context) -> (Box<Core>, R),
+        where
+            F: FnOnce(Box<Core>, &Context) -> (Box<Core>, R),
     {
         let context = self.context.expect_current_thread();
 

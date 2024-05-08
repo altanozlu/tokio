@@ -3,13 +3,14 @@
 // Eventually, this file will see significant refactoring / cleanup. For now, we
 // don't need to worry much about dead code with certain feature permutations.
 #![cfg_attr(
-    any(not(all(tokio_unstable, feature = "full")), target_family = "wasm"),
-    allow(dead_code)
+any(not(all(tokio_unstable, feature = "full")), target_family = "wasm"),
+allow(dead_code)
 )]
 
 use crate::runtime::park::{ParkThread, UnparkThread};
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug)]

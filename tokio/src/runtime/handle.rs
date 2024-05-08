@@ -357,6 +357,8 @@ impl Handle {
             scheduler::Handle::CurrentThread(_) => RuntimeFlavor::CurrentThread,
             #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
             scheduler::Handle::MultiThread(_) => RuntimeFlavor::MultiThread,
+            #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+            scheduler::Handle::MultiThreadUring(_) => RuntimeFlavor::MultiThreadUring,
             #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
             scheduler::Handle::MultiThreadAlt(_) => RuntimeFlavor::MultiThreadAlt,
         }

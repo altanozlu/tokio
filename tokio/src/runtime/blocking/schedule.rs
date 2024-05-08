@@ -25,6 +25,8 @@ impl BlockingSchedule {
                 }
                 #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
                 scheduler::Handle::MultiThread(_) => {}
+                #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+                scheduler::Handle::MultiThreadUring(_) => {}
                 #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
                 scheduler::Handle::MultiThreadAlt(_) => {}
             }
@@ -47,6 +49,8 @@ impl task::Schedule for BlockingSchedule {
                 }
                 #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
                 scheduler::Handle::MultiThread(_) => {}
+                #[cfg(all(feature = "rt-multi-thread", not(target_os = "wasi")))]
+                scheduler::Handle::MultiThreadUring(_) => {}
                 #[cfg(all(tokio_unstable, feature = "rt-multi-thread", not(target_os = "wasi")))]
                 scheduler::Handle::MultiThreadAlt(_) => {}
             }

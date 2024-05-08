@@ -91,6 +91,8 @@ time = []
 [dependencies]
 tokio-macros = { version = "~2.2.0", path = "../tokio-macros", optional = true }
 
+slab = "0.4.9"
+io-uring = { version = "0.6", path = "../../io-uring" }
 pin-project-lite = "0.2.11"
 
 # Everything else is optional...
@@ -174,3 +176,6 @@ allowed_external_types = [
 
    "tokio_macros::*",
 ]
+
+[profile.release]
+debug = 1

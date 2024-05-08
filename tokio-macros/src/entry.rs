@@ -10,6 +10,7 @@ type AttributeArgs = syn::punctuated::Punctuated<syn::Meta, syn::Token![,]>;
 enum RuntimeFlavor {
     CurrentThread,
     Threaded,
+    ThreadedUring,
 }
 
 impl RuntimeFlavor {
@@ -17,6 +18,7 @@ impl RuntimeFlavor {
         match s {
             "current_thread" => Ok(RuntimeFlavor::CurrentThread),
             "multi_thread" => Ok(RuntimeFlavor::Threaded),
+            "multi_thread_uring" => Ok(RuntimeFlavor::ThreadedUring),
             "single_thread" => Err("The single threaded runtime flavor is called `current_thread`.".to_string()),
             "basic_scheduler" => Err("The `basic_scheduler` runtime flavor has been renamed to `current_thread`.".to_string()),
             "threaded_scheduler" => Err("The `threaded_scheduler` runtime flavor has been renamed to `multi_thread`.".to_string()),
@@ -138,10 +140,12 @@ impl Configuration {
                 return Err(syn::Error::new(worker_threads_span, msg));
             }
             (F::CurrentThread, None) => None,
-            (F::Threaded, worker_threads) if self.rt_multi_thread_available => {
+            (F::Threaded, worker_threads) | (F::ThreadedUring, worker_threads)
+                if self.rt_multi_thread_available =>
+            {
                 worker_threads.map(|(val, _span)| val)
             }
-            (F::Threaded, _) => {
+            (F::Threaded, _) | (F::ThreadedUring, _) => {
                 let msg = if self.flavor.is_none() {
                     "The default runtime flavor is `multi_thread`, but the `rt-multi-thread` feature is disabled."
                 } else {
@@ -152,7 +156,8 @@ impl Configuration {
         };
 
         let start_paused = match (flavor, self.start_paused) {
-            (F::Threaded, Some((_, start_paused_span))) => {
+            (F::Threaded, Some((_, start_paused_span)))
+            | (F::ThreadedUring, Some((_, start_paused_span))) => {
                 let msg = format!(
                     "The `start_paused` option requires the `current_thread` runtime flavor. Use `#[{}(flavor = \"current_thread\")]`",
                     self.macro_name(),
@@ -351,6 +356,9 @@ fn parse_knobs(mut input: ItemFn, is_test: bool, config: FinalConfig) -> TokenSt
         },
         RuntimeFlavor::Threaded => quote_spanned! {last_stmt_start_span=>
             #crate_path::runtime::Builder::new_multi_thread()
+        },
+        RuntimeFlavor::ThreadedUring => quote_spanned! {last_stmt_start_span=>
+            #crate_path::runtime::Builder::new_multi_thread_uring()
         },
     };
     if let Some(v) = config.worker_threads {
