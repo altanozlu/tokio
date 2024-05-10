@@ -21,13 +21,13 @@
 
 #![warn(rust_2018_idioms)]
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use std::env;
 use std::error::Error;
 
-#[tokio::main(flavor = "multi_thread_uring", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread_uring", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Allow passing an address to listen on as the first argument of this
     // program, but otherwise we'll just set up our TCP listener on
@@ -61,7 +61,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let mut n = 0;
                 // In a loop, read data from the socket and write the data back.
                 loop {
-                    // println!("reading");
                     if is_uring {
                         let (x, _buf) = socket.read_uring(buf).await;
                         buf = _buf;
@@ -69,15 +68,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     } else {
                         n = socket.read(&mut buf).await.unwrap();
                     }
-                    // println!("len {} buf: {:?}", n, String::from_utf8_lossy(&buf[0..n]));
                     if n == 0 {
                         break;
                     }
-
-                    // socket
-                    //     .write_all(&buf[0..n])
-                    //     .await
-                    //     .expect("failed to write data to socket");
+                    if is_uring {
+                        let (x, _buf) = socket
+                            .write_uring(buf)
+                            .await;
+                        buf = _buf;
+                        n = x.unwrap();
+                    } else {
+                        socket
+                            .write_all(&buf[0..n])
+                            .await
+                            .expect("failed to write data to socket");
+                    }
                 }
             });
         }
