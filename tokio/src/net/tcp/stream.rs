@@ -8,14 +8,13 @@ use crate::io::{AsyncRead, AsyncWrite, Interest, PollEvented, ReadBuf, Ready};
 use crate::net::tcp::split::{split, ReadHalf, WriteHalf};
 use crate::net::tcp::split_owned::{split_owned, OwnedReadHalf, OwnedWriteHalf};
 
-use std::{fmt, ptr};
+use std::{fmt};
 use std::fmt::Pointer;
 use std::io;
 use std::net::{Shutdown, SocketAddr};
 use std::ops::Deref;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use crate::buf::BoundedBufMut;
 use crate::runtime::io::uring::Op;
 
 cfg_io_util! {
@@ -498,7 +497,7 @@ impl TcpStream {
             unreachable!("not mio")
         }
     }
-    pub async fn read_uring<T: BoundedBufMut>(&self, buf: T) -> crate::BufResult<usize, T> {
+    pub async fn read_uring(&self, buf: Vec<u8>) -> crate::BufResult<usize, Vec<u8>> {
         if let IOHolder::Uring(uring) = &self.io_holder {
             let op = Op::read_at(&uring.fd, buf, 0).unwrap();
             op.await
@@ -507,7 +506,7 @@ impl TcpStream {
         }
     }
 
-    pub async fn write_uring<T: BoundedBufMut>(&self, buf: T) -> crate::BufResult<usize, T> {
+    pub async fn write_uring(&self, buf: Vec<u8>) -> crate::BufResult<usize, Vec<u8>> {
         if let IOHolder::Uring(uring) = &self.io_holder {
             let op = Op::write(&uring.fd, buf).unwrap();
             op.await
@@ -750,8 +749,8 @@ impl TcpStream {
     ///     Ok(())
     /// }
     /// ```
-    pub fn try_read_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
-        use std::io::Read;
+    pub fn try_read_vectored(&self, _bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        
 
         // self.io.as_ref().unwrap()
         //     .registration()
@@ -817,7 +816,7 @@ impl TcpStream {
         ///     Ok(())
         /// }
         /// ```
-        pub fn try_read_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+        pub fn try_read_buf<B: BufMut>(&self, _buf: &mut B) -> io::Result<usize> {
             Ok(0)
             // self.io.registration().try_io(Interest::READABLE, || {
             //     use std::io::Read;
@@ -975,9 +974,9 @@ impl TcpStream {
     ///     Ok(())
     /// }
     /// ```
-    pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
-        use std::io::Write;
-        if let IOHolder::MIO(io) = &self.io_holder {
+    pub fn try_write(&self, _buf: &[u8]) -> io::Result<usize> {
+        
+        if let IOHolder::MIO(_io) = &self.io_holder {
             // io.registration()
             //     .try_io(Interest::WRITABLE, || (&*io).write(buf))
             Ok(0)
@@ -1040,8 +1039,8 @@ impl TcpStream {
     ///     Ok(())
     /// }
     /// ```
-    pub fn try_write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        use std::io::Write;
+    pub fn try_write_vectored(&self, _bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        
         // 
         // self.io.as_ref().unwrap()
         //     .registration()

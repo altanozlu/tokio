@@ -10,9 +10,10 @@ use crate::util::TryLock;
 
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::time::Duration;
-use io_uring::types::Timespec;
+
 use crate::runtime::context::URING_CONTEXT;
 use std::sync::atomic::AtomicI32;
+use io_uring::squeue::Flags;
 
 pub(crate) struct Parker {
     inner: Arc<Inner>,
@@ -107,9 +108,11 @@ impl Unparker {
     }
 }
 
+use crate::runtime::io::uring::InternalCommunicationData;
+
 impl Inner {
     /// Parks the current thread for at most `dur`.
-    fn park(&self, handle: &driver::Handle) {
+    fn park(&self, _handle: &driver::Handle) {
         if self
             .state
             .compare_exchange(NOTIFIED, EMPTY, SeqCst, SeqCst)
@@ -148,13 +151,22 @@ impl Inner {
                 URING_CONTEXT.with(|rc| {
                     let binding = rc.handle();
                     let mut ring = binding.uring();
+                    let receiver = ring.receiver.clone();
                     self.fd.store(ring.as_raw_fd(), Relaxed);
                     // println!("parking fd: {}", ring.as_raw_fd());
                     let l = {
                         let mut s = ring.uring.submission();
-                        unsafe {
-                            const ts: Timespec = Timespec::new().nsec(100_000);
-                            s.push(&io_uring::opcode::Timeout::new(&ts as *const Timespec).count(1).build().user_data(u64::MAX)).unwrap();
+                        while let Ok(Some(x)) = receiver.try_recv() {
+                            unsafe {
+                                match x {
+                                    InternalCommunicationData::CancelUD(ud) => {
+                                        s.push(&io_uring::opcode::AsyncCancel::new(ud).build().user_data(u64::MAX).flags(Flags::SKIP_SUCCESS.into())).unwrap();
+                                    }
+                                    InternalCommunicationData::CancelFD(_) => {
+                                        unimplemented!("CancelFD")
+                                    }
+                                }
+                            }
                         }
                         let l = s.len();
                         s.sync();
@@ -185,7 +197,7 @@ impl Inner {
         }
     }
 
-    fn unpark(&self, driver: &driver::Handle) {
+    fn unpark(&self, _driver: &driver::Handle) {
         // To ensure the unparked thread will observe any writes we made before
         // this call, we must perform a release operation that `park` can
         // synchronize with. To do that we must write `NOTIFIED` even if `state`
@@ -205,7 +217,6 @@ impl Inner {
                         s.push(&io_uring::opcode::MsgRingData::new(fd, 0, u64::MAX, None).build())
                             .expect("queue is full");
                     }
-                    println!("unpark");
                 });
             }
             actual => panic!("inconsistent state in unpark; actual = {}", actual),

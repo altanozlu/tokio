@@ -5,9 +5,9 @@ cfg_not_wasi! {
     use crate::net::{to_socket_addrs, ToSocketAddrs};
 }
 
-use std::{fmt, ptr};
-use std::io::{self, Error};
-use std::net::{self, SocketAddr, SocketAddrV4};
+use std::{fmt};
+use std::io::{self};
+use std::net::{self, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::task::{Context, Poll};
 use crate::runtime::io::uring::Op;
@@ -195,7 +195,7 @@ impl TcpListener {
     /// current task will be notified by a waker.  Note that on multiple calls
     /// to `poll_accept`, only the `Waker` from the `Context` passed to the most
     /// recent call is scheduled to receive a wakeup.
-    pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+    pub fn poll_accept(&self, _cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
         return Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
         // loop {
         //     let ev = ready!(self.io.registration().poll_read_ready(cx))?;

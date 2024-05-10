@@ -1,4 +1,3 @@
-use io_uring::opcode::AsyncCancel;
 use io_uring::{cqueue, squeue, IoUring};
 use std::cell::{RefCell, RefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -12,9 +11,8 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 use slab::Slab;
-use crate::io::unix::AsyncFd;
-use crate::loom::cell::UnsafeCell;
-use crate::sync::RwLock;
+
+
 
 pub(crate) struct CqeResult {
     pub(crate) result: io::Result<u32>,
@@ -45,14 +43,14 @@ pub(crate) struct OpInner<T: 'static, CqeType = SingleCQE> {
     _cqe_type: PhantomData<CqeType>,
 }
 
-pub(crate) struct Op<T: 'static, CqeType = SingleCQE> {
+pub(crate) struct Op<T: 'static + Completable, CqeType = SingleCQE> {
     // driver: WeakHandle,
     // Operation index in the slab
     op_inner: OpInner<T, CqeType>,
     ops: Arc<Ops>,
+    ring_sender: kanal::Sender<InternalCommunicationData>,
 }
 
-pub(crate) struct MultiCQEFuture;
 
 impl<T, CqeType> OpInner<T, CqeType> {
     pub(super) fn index(&self) -> usize {
@@ -71,10 +69,11 @@ impl<T, CqeType> OpInner<T, CqeType> {
     }
 }
 
-impl<T, CqeType> Op<T, CqeType> {
+impl<T: Completable, CqeType> Op<T, CqeType> {
     /// Create a new operation
     /// driver: WeakHandle, 
-    pub(super) fn new(data: T, index: usize, ops: Ops) -> Self {
+    pub(super) fn new(data: T, index: usize, ops: Ops,
+                      ring_sender: kanal::Sender<InternalCommunicationData>) -> Self {
         Op {
             // driver,
             op_inner: OpInner {
@@ -83,6 +82,7 @@ impl<T, CqeType> Op<T, CqeType> {
                 _cqe_type: PhantomData,
             },
             ops: Arc::new(ops.into()),
+            ring_sender,
         }
     }
 
@@ -90,9 +90,9 @@ impl<T, CqeType> Op<T, CqeType> {
         self.op_inner.index
     }
 
-    // pub(super) fn take_data(&mut self) -> Option<T> {
-    //     self.data.take()
-    // }
+    pub(super) fn take_data(&mut self) -> Option<T> {
+        self.op_inner.take_data()
+    }
     fn get_data(&self) -> Option<&T> {
         self.op_inner.data.as_ref()
     }
@@ -102,10 +102,23 @@ impl<T, CqeType> Op<T, CqeType> {
     }
 }
 
+impl<T: Completable, CqeType> Drop for Op<T, CqeType> {
+    fn drop(&mut self) {
+        let ops = &mut self.ops.clone();
+        ops.remove_op(self)
+    }
+}
+
 pub(crate) trait Completable {
     type Output;
     /// `complete` will be called for cqe's do not have the `more` flag set
     fn complete(self, cqe: CqeResult) -> Self::Output;
+    fn op_data(self) -> OpData;
+}
+
+pub(crate) enum InternalCommunicationData {
+    CancelUD(u64),
+    CancelFD(usize),
 }
 
 pub(crate) struct Driver {
@@ -113,8 +126,9 @@ pub(crate) struct Driver {
     ops: Ops,
 
     /// IoUring bindings
-    pub uring: IoUring,
-
+    pub(crate) uring: IoUring,
+    pub(crate) receiver: kanal::Receiver<InternalCommunicationData>,
+    pub(crate) sender: kanal::Sender<InternalCommunicationData>,
     // fixed_buffers: Option<Rc<RefCell<dyn FixedBuffers>>>,
 }
 
@@ -127,10 +141,13 @@ impl Debug for Driver {
 impl Driver {
     pub(crate) fn new() -> io::Result<Driver> {
         let uring = IoUring::builder().setup_register_ring_fds().build(1024 ^ 2)?;
+        let (sender, receiver) = kanal::unbounded();
         //let uring = IoUring::new(1024 ^ 2)?;
         Ok(Driver {
             ops: Ops::new(),
             uring,
+            receiver,
+            sender,
             // fixed_buffers: None,
         })
     }
@@ -153,7 +170,7 @@ impl Driver {
         // println!("submit {:?}", std::thread::current().id());
         loop {
             match self.uring.submit() {
-                Ok(n) => {
+                Ok(_n) => {
                     self.uring.submission().sync();
                     // println!("SUBMIT COUNT {n}");
                     return Ok(());
@@ -177,20 +194,21 @@ impl Driver {
             T: Completable,
             F: FnOnce(&mut T) -> squeue::Entry,
     {
-        // println!("submit_op {:?}", std::thread::current().id());
         let index = self.ops.insert();
 
         // Configure the SQE
         let sqe = f(&mut data).user_data(index as _);
         // Create the operation
-        let op = Op::new(data, index, self.ops.clone());
+        let op = Op::new(data, index, self.ops.clone(), self.sender.clone());
+
+        println!("submit_op {} {:?}", index, std::thread::current().id());
 
         // Push the new operation
         while unsafe { self.uring.submission().push(&sqe).is_err() } {
             // If the submission queue is full, flush it to the kernel
+            println!("full");
             self.submit()?;
         }
-        self.submit()?;
         Ok(op)
     }
 
@@ -226,9 +244,9 @@ impl Driver {
             let mut cq = self.uring.completion();
             cq.sync();
             for cqe in cq {
-                // println!("{:?} {:?}", cqe, std::thread::current().id());
-                if cqe.user_data() == 999987 || cqe.result() < 0 || cqe.user_data() == u64::MAX || (cqe.user_data() == 0 && cqe.flags() == 0 && cqe.result()==0) {
-                    // println!("ERROR: {:?}", cqe);
+                println!("{:?} {:?}", cqe, std::thread::current().id());
+                if cqe.user_data() == u64::MAX || (cqe.user_data() == 0 && cqe.flags() == 0 && cqe.result() == 0) {
+                    println!("ERROR: {:?}", cqe);
                     continue;
                 }
                 if cqe.user_data() == u64::MAX {
@@ -244,6 +262,43 @@ impl Driver {
         }
         self.uring.completion().sync();
     }
+    //
+    // pub(crate) fn remove_op<T: Completable, CqeType>(&mut self, op: &mut Op<T, CqeType>) {
+    //     // Get the Op Lifecycle state from the driver
+    //     let mut lc = self.ops.lifecycle.write();
+    //     let lifecycle = match lc.get_mut(op.index()) {
+    //         Some(val) => val,
+    //         None => {
+    //             // Op dropped after the driver
+    //             return;
+    //         }
+    //     };
+    //
+    //     match mem::replace(lifecycle, Lifecycle::Submitted) {
+    //         Lifecycle::Submitted | Lifecycle::Waiting(_) => {
+    //             *lifecycle = Lifecycle::Ignored(Box::new(op.op_inner.take_data().unwrap().op_data()));//TODO unwrap
+    //         }
+    //         Lifecycle::Completed(..) => {
+    //             lc.remove(op.index());
+    //         }
+    //         Lifecycle::CompletionList(indices) => {
+    //             // Deallocate list entries, recording if more CQE's are expected
+    //             let more = {
+    //                 let mut completions = self.ops.completions.write();
+    //                 let mut list = indices.into_list(&mut completions);
+    //                 cqueue::more(list.peek_end().unwrap().flags)
+    //                 // Dropping list deallocates the list entries
+    //             };
+    //             if more {
+    //                 // If more are expected, we have to keep the op around
+    //                 *lifecycle = Lifecycle::Ignored(Box::new(op.op_inner.take_data().unwrap().op_data()));//TODO unwrap
+    //             } else {
+    //                 lc.remove(op.index());
+    //             }
+    //         }
+    //         Lifecycle::Ignored(..) => unreachable!(),
+    //     }
+    // }
 }
 
 impl AsRawFd for Driver {
@@ -285,7 +340,7 @@ impl WeakHandle {
 impl Handle {
     pub(crate) fn new() -> io::Result<Self> {
         let driver = Driver::new()?;
-        let fd = driver.as_raw_fd();
+        let _fd = driver.as_raw_fd();
         Ok(Self {
             inner: Rc::new(RefCell::new(driver)),
         })
@@ -353,9 +408,9 @@ impl Ops {
     }
 
     // Remove an operation
-    // fn remove(&mut self, index: usize) {
-    //     self.lifecycle.write().remove(index);
-    // }
+    fn remove(&mut self, index: usize) {
+        self.lifecycle.write().remove(index);
+    }
 
     fn complete(&mut self, index: usize, cqe: cqueue::Entry) {
         let completions = &mut self.completions.write();
@@ -372,7 +427,7 @@ impl Ops {
         let lifecycle = lc
             .get_mut(op.index())
             .expect("invalid internal state");
-
+        println!("polling op {}", op.index());
         match mem::replace(lifecycle, Lifecycle::Submitted) {
             Lifecycle::Submitted => {
                 *lifecycle = Lifecycle::Waiting(cx.waker().clone());
@@ -386,7 +441,7 @@ impl Ops {
                 *lifecycle = Lifecycle::Waiting(waker);
                 Poll::Pending
             }
-            // Lifecycle::Ignored(..) => unreachable!(),
+            Lifecycle::Ignored(..) => unreachable!(),
             Lifecycle::Completed(cqe) => {
                 lc.remove(op.index());
                 Poll::Ready(op.take_data().unwrap().complete(cqe.into()))
@@ -394,6 +449,62 @@ impl Ops {
             Lifecycle::CompletionList(..) => {
                 unreachable!("No `more` flag set for SingleCQE")
             }
+        }
+    }
+    pub(crate) fn remove_op<T: Completable, CqeType>(&self, op: &mut Op<T, CqeType>) {
+
+        // Get the Op Lifecycle state from the driver
+        let mut lc = self.lifecycle.write();
+        let lifecycle = match lc.get_mut(op.index()) {
+            Some(val) => val,
+            None => {
+                // Op dropped after the driver
+                return;
+            }
+        };
+        println!("removing op ");
+        let ignore = |index| {
+            op.ring_sender.send(InternalCommunicationData::CancelUD(index as u64)).unwrap();
+            // URING_CONTEXT.with(|rc| {
+            //     let binding = rc.handle();
+            //     let mut ring = binding.uring();
+            //     unsafe {
+            //         while ring.uring.submission().push(&AsyncCancel::new(index as u64).build().user_data(u64::MAX)).is_err() {
+            //             ring.uring.submit().unwrap();
+            //             ring.dispatch_completions();
+            //         }
+            //     }
+            // });
+        };
+        match mem::replace(lifecycle, Lifecycle::Submitted) {
+            Lifecycle::Submitted | Lifecycle::Waiting(_) => {
+                let data = op.op_inner.take_data().unwrap().op_data();
+                println!("removing op submitted {} {:?}", op.index(), data);
+                *lifecycle = Lifecycle::Ignored(Box::new(data));//TODO unwrap
+                ignore(op.index())
+            }
+            Lifecycle::Completed(..) => {
+                println!("removing op Completed");
+                lc.remove(op.index());
+            }
+            Lifecycle::CompletionList(indices) => {
+                // Deallocate list entries, recording if more CQE's are expected
+                let more = {
+                    let mut completions = self.completions.write();
+                    let mut list = indices.into_list(&mut completions);
+                    cqueue::more(list.peek_end().unwrap().flags)
+                    // Dropping list deallocates the list entries
+                };
+                if more {
+                    // If more are expected, we have to keep the op around
+                    *lifecycle = Lifecycle::Ignored(Box::new(op.op_inner.take_data().unwrap().op_data()));//TODO unwrap
+
+                    ignore(op.index())
+                } else {
+                    lc.remove(op.index());
+                }
+            }
+            Lifecycle::Ignored(..) => unreachable!(),
         }
     }
 }
@@ -493,6 +604,8 @@ pub(crate) struct SlabListEntry<T> {
 
 pub(crate) type Completion = SlabListEntry<CqeResult>;
 
+use crate::runtime::io::uring_op::OpData;
+
 pub(crate) enum Lifecycle {
     /// The operation has been submitted to uring and is currently in-flight
     Submitted,
@@ -502,7 +615,7 @@ pub(crate) enum Lifecycle {
 
     /// The submitter no longer has interest in the operation result. The state
     /// must be passed to the driver and held until the operation completes.
-    // Ignored(Box<dyn std::any::Any>),
+    Ignored(Box<OpData>),
 
     /// The operation has completed with a single cqe result
     Completed(cqueue::Entry),
@@ -536,17 +649,17 @@ impl Lifecycle {
                 false
             }
 
-            // lifecycle @ Lifecycle::Ignored(..) => {
-            //     if io_uring::cqueue::more(cqe.flags()) {
-            //         // Not yet complete. The Op has been dropped, so we can drop the CQE
-            //         // but we must keep the lifecycle alive until no more CQE's expected
-            //         *self = lifecycle;
-            //         false
-            //     } else {
-            //         // This Op has completed, we can drop
-            //         true
-            //     }
-            // }
+            lifecycle @ Lifecycle::Ignored(..) => {
+                if io_uring::cqueue::more(cqe.flags()) {
+                    // Not yet complete. The Op has been dropped, so we can drop the CQE
+                    // but we must keep the lifecycle alive until no more CQE's expected
+                    *self = lifecycle;
+                    false
+                } else {
+                    // This Op has completed, we can drop
+                    true
+                }
+            }
 
             Lifecycle::Completed(..) => {
                 // Completions with more flag set go straight onto the slab,
@@ -574,7 +687,7 @@ impl<T> Future for Op<T, SingleCQE>
 {
     type Output = T::Output;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut _self = self.get_mut();
         let ops = &mut _self.ops;
         let inner = &mut _self.op_inner;

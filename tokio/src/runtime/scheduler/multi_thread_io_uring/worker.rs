@@ -71,10 +71,10 @@ use crate::util::atomic_cell::AtomicCell;
 use crate::util::rand::{FastRand, RngSeedGenerator};
 
 use std::cell::RefCell;
-use std::os::fd::AsRawFd;
+
 use std::task::Waker;
 use std::time::Duration;
-use crate::runtime::io::uring::{Completable, Op};
+
 
 cfg_metrics! {
     mod metrics;

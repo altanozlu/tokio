@@ -1,7 +1,7 @@
 #![cfg_attr(not(all(feature = "rt", feature = "net")), allow(dead_code))]
 mod driver;
-pub mod uring;
-pub mod uring_op;
+pub(crate) mod uring;
+pub(crate) mod uring_op;
 use driver::{Direction, Tick};
 pub(crate) use driver::{Driver, Handle, ReadyEvent};
 

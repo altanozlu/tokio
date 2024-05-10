@@ -10,7 +10,7 @@ allow(dead_code)
 use crate::runtime::park::{ParkThread, UnparkThread};
 
 use std::io;
-use std::sync::Arc;
+
 use std::time::Duration;
 
 #[derive(Debug)]

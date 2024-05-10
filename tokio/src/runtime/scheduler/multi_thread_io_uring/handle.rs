@@ -8,7 +8,7 @@ use crate::runtime::{
 use crate::util::RngSeedGenerator;
 
 use std::fmt;
-use parking_lot::Mutex;
+
 
 cfg_metrics! {
     mod metrics;

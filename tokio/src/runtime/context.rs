@@ -1,7 +1,7 @@
 use crate::loom::thread::AccessError;
 use crate::runtime::coop;
 
-use std::cell::{Cell, Ref};
+use std::cell::{Cell};
 
 #[cfg(any(feature = "rt", feature = "macros"))]
 use crate::util::rand::FastRand;
@@ -125,17 +125,17 @@ tokio_thread_local! {
     pub(crate) static URING_CONTEXT: RuntimeContext = RuntimeContext::new();
 }
 use std::cell::RefCell;
-use std::os::fd::AsRawFd;
-use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
-use mio::unix::SourceFd;
-use crate::io::Interest;
-use crate::io::unix::AsyncFd;
-use crate::runtime::io::Registration;
+
+
+
+
+
+
+
 use crate::runtime::io::uring::Handle;
 
 pub(crate) struct RuntimeContext {
-    pub driver: RefCell<Option<Handle>>,
+    pub(crate) driver: RefCell<Option<Handle>>,
 }
 
 impl RuntimeContext {

@@ -1,4 +1,4 @@
-use crate::net::{TcpListener, TcpStream};
+use crate::net::{TcpStream};
 
 use std::fmt;
 use std::io;

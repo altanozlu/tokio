@@ -1,13 +1,10 @@
 use std::io;
-use std::marker::PhantomData;
+
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::thread::spawn;
-use io_uring::{squeue, sys};
-use crate::buf::BoundedBufMut;
 use crate::BufResult;
-use crate::runtime::context::{RuntimeContext, thread_id, URING_CONTEXT};
+use crate::runtime::context::{URING_CONTEXT};
 
 use crate::runtime::io::uring::{Completable, CqeResult, Op};
 
@@ -50,7 +47,7 @@ impl Op<Accept> {
         // spawn()
         // println!("a: {:?}", std::thread::current().id());
         // crate::runtime::context::with_current(|handle| {
-        //     // println!("a: {:?}", std::thread::current().id());
+        //     // println!("a: {:?}", std::thread:current().id());
         // }).unwrap();
         URING_CONTEXT.with(|x| {
             let h = x.handle();
@@ -105,21 +102,25 @@ impl Completable for Accept {
         // println!("{:?}",addr);
         Ok((socket, addr.as_socket()))
     }
+
+    fn op_data(self) -> OpData {
+        OpData::Accept(self)
+    }
 }
 
 
-pub(crate) struct Read<T> {
+pub(crate) struct Read {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
     #[allow(dead_code)]
     fd: SharedFd,
 
     /// Reference to the in-flight buffer.
-    pub(crate) buf: T,
+    pub(crate) buf: Vec<u8>,
 }
 
-impl<T: BoundedBufMut> Op<Read<T>> {
-    pub(crate) fn read_at(fd: &SharedFd, buf: T, offset: u64) -> io::Result<Op<Read<T>>> {
+impl Op<Read> {
+    pub(crate) fn read_at(fd: &SharedFd, buf: Vec<u8>, offset: u64) -> io::Result<Op<Read>> {
         use io_uring::{opcode, types};
 
         URING_CONTEXT.with(|x| {
@@ -129,8 +130,8 @@ impl<T: BoundedBufMut> Op<Read<T>> {
                     buf,
                 },
                 |read| {
-                    let ptr = read.buf.stable_mut_ptr();
-                    let len = read.buf.bytes_total();
+                    let ptr = read.buf.as_mut_ptr();
+                    let len = read.buf.capacity();
                     opcode::Read::new(types::Fd(fd.raw_fd()), ptr, len as _)
                         .offset(offset as _)
                         .build()
@@ -139,11 +140,10 @@ impl<T: BoundedBufMut> Op<Read<T>> {
         })
     }
 }
-impl<T> Completable for Read<T>
-    where
-        T: BoundedBufMut,
+
+impl Completable for Read
 {
-    type Output = BufResult<usize, T>;
+    type Output = BufResult<usize, Vec<u8>>;
 
     fn complete(self, cqe: CqeResult) -> Self::Output {
         // Convert the operation result to `usize`
@@ -155,11 +155,17 @@ impl<T> Completable for Read<T>
         if let Ok(n) = res {
             // Safety: the kernel wrote `n` bytes to the buffer.
             unsafe {
-                buf.set_init(n);
+                if buf.len() < n {
+                    buf.set_len(n);
+                }
             }
         }
 
         (res, buf)
+    }
+
+    fn op_data(self) -> OpData {
+        OpData::Read(self)
     }
 }
 
@@ -187,18 +193,18 @@ impl<T> Completable for Read<T>
 //         )
 //     }
 // }
-pub(crate) struct Write<T> {
+pub(crate) struct Write {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
     #[allow(dead_code)]
     fd: SharedFd,
 
     /// Reference to the in-flight buffer.
-    pub(crate) buf: T,
+    pub(crate) buf: Vec<u8>,
 }
 
-impl<T: BoundedBufMut> Op<crate::runtime::io::uring_op::Write<T>> {
-    pub(crate) fn write(fd: &SharedFd, buf: T) -> io::Result<Op<crate::runtime::io::uring_op::Write<T>>> {
+impl Op<crate::runtime::io::uring_op::Write> {
+    pub(crate) fn write(fd: &SharedFd, buf: Vec<u8>) -> io::Result<Op<crate::runtime::io::uring_op::Write>> {
         use io_uring::{opcode, types};
 
         URING_CONTEXT.with(|x| {
@@ -208,8 +214,8 @@ impl<T: BoundedBufMut> Op<crate::runtime::io::uring_op::Write<T>> {
                     buf,
                 },
                 |read| {
-                    let ptr = read.buf.stable_mut_ptr();
-                    let len = read.buf.bytes_init();
+                    let ptr = read.buf.as_mut_ptr();
+                    let len = read.buf.capacity();
                     opcode::Write::new(types::Fd(fd.raw_fd()), ptr, len as _)
                         .build()
                 },
@@ -218,11 +224,10 @@ impl<T: BoundedBufMut> Op<crate::runtime::io::uring_op::Write<T>> {
     }
 }
 
-impl<T> Completable for crate::runtime::io::uring_op::Write<T>
-    where
-        T: BoundedBufMut,
+impl Completable for crate::runtime::io::uring_op::Write
+
 {
-    type Output = BufResult<usize, T>;
+    type Output = BufResult<usize, Vec<u8>>;
 
     fn complete(self, cqe: CqeResult) -> Self::Output {
         // Convert the operation result to `usize`
@@ -234,10 +239,34 @@ impl<T> Completable for crate::runtime::io::uring_op::Write<T>
         if let Ok(n) = res {
             // Safety: the kernel wrote `n` bytes to the buffer.
             unsafe {
-                buf.set_init(n);
+                if buf.len() < n {
+                    buf.set_len(n);
+                }
             }
         }
 
         (res, buf)
+    }
+    fn op_data(self) -> OpData {
+        OpData::Write(self)
+    }
+}
+
+pub(crate) enum OpData {
+    Read(Read),
+    Write(Write),
+    Accept(Accept),
+}
+
+use std::fmt;
+use std::fmt::Debug;
+
+impl Debug for OpData {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            OpData::Read(_) => write!(f, "Read"),
+            OpData::Write(_) => write!(f, "Write"),
+            OpData::Accept(_) => write!(f, "Accept"),
+        }
     }
 }
